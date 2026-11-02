@@ -727,9 +727,19 @@ struct MenuBarPanelControllerTests {
         #expect(sharedController.isPanelVisible == false)
 
         // 2. Long hold (>= threshold): opens the panel, presents the assistant bar, and starts Hold-to-Talk.
+        // Poll the hold flag instead of a fixed sleep: the MainActor hold Task can be delayed behind
+        // panel show/hide from the short taps, especially on Intel.
         HotkeyAndNotificationManager.shared.handleGlobalHotKeyPressed(holdThreshold: 0.03)
-        try await Task.sleep(for: .milliseconds(70))
+        var holdTriggered = false
+        for _ in 0..<100 {
+            if HotkeyAndNotificationManager.shared.isHotkeyHoldTriggered {
+                holdTriggered = true
+                break
+            }
+            try await Task.sleep(for: .milliseconds(20))
+        }
         #expect(HotkeyAndNotificationManager.shared.isHotkeyPhysicallyDown)
+        #expect(holdTriggered)
         #expect(HotkeyAndNotificationManager.shared.isHotkeyHoldTriggered)
         #expect(sharedController.isPanelVisible)
         #expect(store.isShowingAssistantBar)

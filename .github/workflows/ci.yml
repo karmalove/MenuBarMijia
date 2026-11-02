@@ -115,6 +115,8 @@ jobs:
       - name: Install ripgrep
         run: command -v rg >/dev/null || brew install ripgrep
       - name: Build app (release and App Intents metadata)
+        env:
+          REQUIRE_UNIVERSAL: "1"
         run: bash scripts/build_app.sh
       - name: Perturb baseline for the manual snapshot failure probe
         if: github.event_name == 'workflow_dispatch' && inputs.snapshot_failure_probe

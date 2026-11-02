@@ -1,4 +1,11 @@
 #!/bin/bash
+# 打包 MenuBarMijia.app。
+#
+# 架构：
+#   本机默认只编当前 CPU（Intel → x86_64，Apple Silicon → arm64）。
+#   Intel 安装包：MACOS_ARCHS=x86_64 MAKE_DMG=1 bash scripts/build_app.sh
+#   通用二进制：REQUIRE_UNIVERSAL=1 bash scripts/build_app.sh
+#   显式指定：MACOS_ARCHS="arm64 x86_64"
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -45,15 +52,98 @@ if [ -n "$MACOS_CERT_SHA1" ] && ! printf '%s' "$MACOS_CERT_SHA1" | grep -Eq '^[0
     exit 1
 fi
 
-echo "▶ 正在编译 MenuBarMijiaApp $VERSION (Release Universal: arm64 + x86_64)..."
-swift build -c release --product MenuBarMijiaApp --arch arm64 --arch x86_64
+# Intel Mac 与 Apple Silicon 都能打包：
+#   本机默认只编当前 CPU（Intel → x86_64，Apple Silicon → arm64），避免交叉编译失败把整包打断。
+#   发布 / CI 设 REQUIRE_UNIVERSAL=1，必须产出 arm64 + x86_64 通用二进制。
+#   也可显式指定：MACOS_ARCHS="x86_64" 或 MACOS_ARCHS="arm64 x86_64"。
+export MACOSX_DEPLOYMENT_TARGET="${MACOSX_DEPLOYMENT_TARGET:-14.0}"
+HOST_ARCH="$(uname -m)"
+case "$HOST_ARCH" in
+    arm64|x86_64) ;;
+    *) HOST_ARCH="x86_64" ;;
+esac
+if [ "${REQUIRE_UNIVERSAL:-0}" = "1" ]; then
+    MACOS_ARCHS="${MACOS_ARCHS:-arm64 x86_64}"
+else
+    MACOS_ARCHS="${MACOS_ARCHS:-$HOST_ARCH}"
+fi
+REQUESTED_ARCHS=""
+for arch in $MACOS_ARCHS; do
+    case "$arch" in
+        arm64|x86_64)
+            if ! printf '%s' " $REQUESTED_ARCHS " | grep -q " $arch "; then
+                REQUESTED_ARCHS="${REQUESTED_ARCHS:+$REQUESTED_ARCHS }$arch"
+            fi
+            ;;
+        *)
+            echo "❌ 不支持的 MACOS_ARCHS 值：$arch（仅 arm64 / x86_64）" >&2
+            exit 1
+            ;;
+    esac
+done
+[ -n "$REQUESTED_ARCHS" ] || { echo "❌ MACOS_ARCHS 为空" >&2; exit 1; }
 
-BIN_PATH="$(swift build -c release --product MenuBarMijiaApp --arch arm64 --arch x86_64 --show-bin-path)/MenuBarMijiaApp"
-ARCHS="$(lipo -archs "$BIN_PATH" 2>/dev/null || true)"
-if ! printf '%s' "$ARCHS" | grep -qw "arm64" || ! printf '%s' "$ARCHS" | grep -qw "x86_64"; then
-    echo "❌ MenuBarMijiaApp 未包含完整通用二进制架构（当前：${ARCHS:-<未知>}，期望：arm64 + x86_64）" >&2
+binary_covers_archs() {
+    local binary="$1"
+    local needed="$2"
+    local have arch
+    have="$(lipo -archs "$binary" 2>/dev/null || true)"
+    for arch in $needed; do
+        printf '%s' "$have" | grep -qw "$arch" || return 1
+    done
+    return 0
+}
+
+BUILT_BINS=""
+BUILT_ARCHS=""
+RESOURCE_BUNDLE=""
+for arch in $REQUESTED_ARCHS; do
+    echo "▶ 正在编译 MenuBarMijiaApp $VERSION (Release $arch, macOS ${MACOSX_DEPLOYMENT_TARGET}+)..."
+    if ! swift build -c release --product MenuBarMijiaApp --arch "$arch"; then
+        if [ "${REQUIRE_UNIVERSAL:-0}" = "1" ]; then
+            echo "❌ REQUIRE_UNIVERSAL=1：$arch 编译失败，已中止发布打包" >&2
+            exit 1
+        fi
+        echo "⚠️ $arch 编译失败，继续尝试其余架构"
+        continue
+    fi
+    arch_bin="$(swift build -c release --product MenuBarMijiaApp --arch "$arch" --show-bin-path)/MenuBarMijiaApp"
+    if ! binary_covers_archs "$arch_bin" "$arch"; then
+        echo "⚠️ $arch 产物未包含该切片（当前：$(lipo -archs "$arch_bin" 2>/dev/null || echo 未知)），跳过" >&2
+        if [ "${REQUIRE_UNIVERSAL:-0}" = "1" ]; then
+            exit 1
+        fi
+        continue
+    fi
+    BUILT_BINS="${BUILT_BINS:+$BUILT_BINS }$arch_bin"
+    BUILT_ARCHS="${BUILT_ARCHS:+$BUILT_ARCHS }$arch"
+    if [ -z "$RESOURCE_BUNDLE" ]; then
+        candidate="$(dirname "$arch_bin")/MenuBarMijia_MijiaCore.bundle"
+        [ -d "$candidate" ] && RESOURCE_BUNDLE="$candidate"
+    fi
+done
+if [ -z "$BUILT_ARCHS" ]; then
+    echo "❌ 没有成功编译任何 macOS 架构（请求：${REQUESTED_ARCHS}）" >&2
     exit 1
 fi
+if [ "${REQUIRE_UNIVERSAL:-0}" = "1" ] && { ! printf '%s' "$BUILT_ARCHS" | grep -qw "arm64" || ! printf '%s' "$BUILT_ARCHS" | grep -qw "x86_64"; }; then
+    echo "❌ REQUIRE_UNIVERSAL=1：发布二进制缺少通用架构支持（当前：${BUILT_ARCHS}，期望：arm64 + x86_64）" >&2
+    exit 1
+fi
+
+FAT_BIN="$ROOT/.build/MenuBarMijiaApp-macos"
+mkdir -p "$ROOT/.build"
+# shellcheck disable=SC2086
+if [ "$(printf '%s' "$BUILT_BINS" | wc -w | tr -d ' ')" = "1" ]; then
+    cp $BUILT_BINS "$FAT_BIN"
+else
+    # shellcheck disable=SC2086
+    lipo -create $BUILT_BINS -output "$FAT_BIN"
+fi
+chmod +x "$FAT_BIN"
+BIN_PATH="$FAT_BIN"
+ARCHS="$(lipo -archs "$BIN_PATH" 2>/dev/null || true)"
+echo "✅ 已生成安装包二进制（${ARCHS}）"
 APP_DIR="$ROOT/MenuBarMijia.app"
 rm -rf "$ROOT/米家控制中心.app" "$ROOT/MenuMijia.app"  # 清理旧名字产物
 
@@ -71,8 +161,7 @@ cp "$ROOT/Resources/AppIcon/AppIcon.icns" "$APP_DIR/Contents/Resources/AppIcon.i
 cp "$ROOT/Resources/AppIcon/AppIcon-Dark.icns" "$APP_DIR/Contents/Resources/AppIcon-Dark.icns"
 cp "$ROOT/Resources/AppIcon/AppIcon-Light.icns" "$APP_DIR/Contents/Resources/AppIcon-Light.icns"
 cp "$ROOT/Resources/AppIcon/Assets.car" "$APP_DIR/Contents/Resources/Assets.car"
-RESOURCE_BUNDLE="$(dirname "$BIN_PATH")/MenuBarMijia_MijiaCore.bundle"
-if [ ! -d "$RESOURCE_BUNDLE" ]; then
+if [ -z "$RESOURCE_BUNDLE" ] || [ ! -d "$RESOURCE_BUNDLE" ]; then
     echo "❌ 缺少本地化资源包 MenuBarMijia_MijiaCore.bundle" >&2
     exit 1
 fi
@@ -80,45 +169,66 @@ cp -R "$RESOURCE_BUNDLE" "$APP_DIR/Contents/Resources/MenuBarMijia_MijiaCore.bun
 
 GO2RTC_CACHED="$HOME/Library/Application Support/MenuBarMijia/bin/go2rtc"
 GO2RTC_ARCHS="$(lipo -archs "$GO2RTC_CACHED" 2>/dev/null || true)"
-if ! (printf '%s' "$GO2RTC_ARCHS" | grep -qw "arm64" && printf '%s' "$GO2RTC_ARCHS" | grep -qw "x86_64"); then
-    echo "▶ 正在准备通用架构 go2rtc (arm64 + x86_64, v1.9.15)..."
+if [ ! -x "$GO2RTC_CACHED" ] || ! binary_covers_archs "$GO2RTC_CACHED" "$BUILT_ARCHS"; then
+    echo "▶ 正在准备 go2rtc ($BUILT_ARCHS, v1.9.15)..."
     GO2RTC_TMP="$(mktemp -d)"
     GO2RTC_ARM64_SHA256="d0cf858a71803dce2377423bc830639137ee96c335f88e9912e7f7898374266d"
     GO2RTC_AMD64_SHA256="7ca6075421b824eebe0383d20bd42a6f6a7ec7591a60931d42290f1d375169b9"
+    GO2RTC_ARM64_OK=0
+    GO2RTC_AMD64_OK=0
     if curl -fsSL --retry 2 --max-time 45 "https://github.com/AlexxIT/go2rtc/releases/download/v1.9.15/go2rtc_mac_arm64.zip" -o "$GO2RTC_TMP/arm64.zip" \
-        && curl -fsSL --retry 2 --max-time 45 "https://github.com/AlexxIT/go2rtc/releases/download/v1.9.15/go2rtc_mac_amd64.zip" -o "$GO2RTC_TMP/amd64.zip" \
-        && [ "$(shasum -a 256 "$GO2RTC_TMP/arm64.zip" | awk '{print $1}')" = "$GO2RTC_ARM64_SHA256" ] \
-        && [ "$(shasum -a 256 "$GO2RTC_TMP/amd64.zip" | awk '{print $1}')" = "$GO2RTC_AMD64_SHA256" ]; then
-        mkdir -p "$GO2RTC_TMP/arm64" "$GO2RTC_TMP/amd64" "$(dirname "$GO2RTC_CACHED")"
+        && [ "$(shasum -a 256 "$GO2RTC_TMP/arm64.zip" | awk '{print $1}')" = "$GO2RTC_ARM64_SHA256" ]; then
+        mkdir -p "$GO2RTC_TMP/arm64"
         ditto -x -k "$GO2RTC_TMP/arm64.zip" "$GO2RTC_TMP/arm64"
+        GO2RTC_ARM64_OK=1
+    fi
+    if curl -fsSL --retry 2 --max-time 45 "https://github.com/AlexxIT/go2rtc/releases/download/v1.9.15/go2rtc_mac_amd64.zip" -o "$GO2RTC_TMP/amd64.zip" \
+        && [ "$(shasum -a 256 "$GO2RTC_TMP/amd64.zip" | awk '{print $1}')" = "$GO2RTC_AMD64_SHA256" ]; then
+        mkdir -p "$GO2RTC_TMP/amd64"
         ditto -x -k "$GO2RTC_TMP/amd64.zip" "$GO2RTC_TMP/amd64"
+        GO2RTC_AMD64_OK=1
+    fi
+    mkdir -p "$(dirname "$GO2RTC_CACHED")"
+    if [ "$GO2RTC_ARM64_OK" = "1" ] && [ "$GO2RTC_AMD64_OK" = "1" ]; then
         lipo -create "$GO2RTC_TMP/arm64/go2rtc" "$GO2RTC_TMP/amd64/go2rtc" -output "$GO2RTC_CACHED"
         chmod 755 "$GO2RTC_CACHED"
         GO2RTC_ARCHS="$(lipo -archs "$GO2RTC_CACHED" 2>/dev/null || true)"
         echo "✅ 已合成为通用架构 go2rtc ($GO2RTC_ARCHS)"
+    elif [ "$GO2RTC_AMD64_OK" = "1" ] && printf '%s' "$BUILT_ARCHS" | grep -qw "x86_64" && ! printf '%s' "$BUILT_ARCHS" | grep -qw "arm64"; then
+        cp "$GO2RTC_TMP/amd64/go2rtc" "$GO2RTC_CACHED"
+        chmod 755 "$GO2RTC_CACHED"
+        echo "✅ 已写入 Intel (x86_64) go2rtc"
+    elif [ "$GO2RTC_ARM64_OK" = "1" ] && printf '%s' "$BUILT_ARCHS" | grep -qw "arm64" && ! printf '%s' "$BUILT_ARCHS" | grep -qw "x86_64"; then
+        cp "$GO2RTC_TMP/arm64/go2rtc" "$GO2RTC_CACHED"
+        chmod 755 "$GO2RTC_CACHED"
+        echo "✅ 已写入 Apple Silicon (arm64) go2rtc"
     else
-        echo "⚠️ 未能下载通用架构 go2rtc（运行时首次打开摄像机将按需自动补齐）"
+        echo "⚠️ 未能下载与当前架构匹配的 go2rtc（运行时首次打开摄像机将按需自动补齐）"
     fi
     rm -rf "$GO2RTC_TMP"
 fi
 if [ -x "$GO2RTC_CACHED" ]; then
     GO2RTC_ARCHS="$(lipo -archs "$GO2RTC_CACHED" 2>/dev/null || true)"
-    if printf '%s' "$GO2RTC_ARCHS" | grep -qw "arm64" && printf '%s' "$GO2RTC_ARCHS" | grep -qw "x86_64"; then
+    if binary_covers_archs "$GO2RTC_CACHED" "$BUILT_ARCHS"; then
         mkdir -p "$APP_DIR/Contents/Resources/bin"
         cp "$GO2RTC_CACHED" "$APP_DIR/Contents/Resources/bin/go2rtc"
         chmod +x "$APP_DIR/Contents/Resources/bin/go2rtc"
     else
-        echo "ℹ️ 本机缓存的 go2rtc 仅含单架构（${GO2RTC_ARCHS:-未知}），跳过打入通用安装包（本机运行仍可直接使用缓存或 Homebrew 路径）"
+        echo "ℹ️ 本机缓存的 go2rtc（${GO2RTC_ARCHS:-未知}）未覆盖安装包架构 ${BUILT_ARCHS}，跳过打入（本机运行仍可直接使用缓存或 Homebrew 路径）"
     fi
 fi
 
 cp "$BIN_PATH" "$APP_DIR/Contents/MacOS/MenuBarMijiaApp"
 chmod +x "$APP_DIR/Contents/MacOS/MenuBarMijiaApp"
 strip -S -x "$APP_DIR/Contents/MacOS/MenuBarMijiaApp"
-if ! SYMBOL_TABLE="$(nm -arch arm64 -ap "$APP_DIR/Contents/MacOS/MenuBarMijiaApp" && nm -arch x86_64 -ap "$APP_DIR/Contents/MacOS/MenuBarMijiaApp")"; then
-    echo "❌ 无法读取 MenuBarMijiaApp 符号表，不能确认发布包是否泄露本机路径。" >&2
-    exit 1
-fi
+SYMBOL_TABLE=""
+for arch in $BUILT_ARCHS; do
+    if ! arch_syms="$(nm -arch "$arch" -ap "$APP_DIR/Contents/MacOS/MenuBarMijiaApp")"; then
+        echo "❌ 无法读取 MenuBarMijiaApp $arch 符号表，不能确认发布包是否泄露本机路径。" >&2
+        exit 1
+    fi
+    SYMBOL_TABLE="${SYMBOL_TABLE}${arch_syms}"$'\n'
+done
 LEAKED_SYMBOLS="$(printf '%s\n' "$SYMBOL_TABLE" | grep "/Users/" || true)"
 if [ -n "$LEAKED_SYMBOLS" ]; then
     echo "❌ MenuBarMijiaApp 符号表中仍残留本地编译路径 (/Users/)！"
@@ -262,7 +372,9 @@ generate_app_intents_metadata_via_xcode() {
         esac
         if xcodebuild \
             -scheme "$scheme" \
-            -destination 'platform=macOS' \
+            -destination "platform=macOS,arch=${HOST_ARCH}" \
+            ARCHS="$HOST_ARCH" \
+            ONLY_ACTIVE_ARCH=YES \
             -configuration Release \
             -derivedDataPath "$derived" \
             build >"$ROOT/.build/appintents-build.log" 2>&1; then
@@ -371,7 +483,28 @@ else
         --entitlements "$ROOT/scripts/MenuBarMijia.entitlements" \
         --sign "$SIGN_IDENTITY" "$APP_DIR"
 fi
-echo "✅ 已打包完成：$APP_DIR"
+echo "✅ 已打包完成：${APP_DIR}（架构：${ARCHS}）"
+
+if [ "${MAKE_DMG:-0}" = "1" ]; then
+    DIST="$ROOT/dist"
+    rm -rf "$DIST/stage"
+    mkdir -p "$DIST/stage"
+    cp -R "$APP_DIR" "$DIST/stage/"
+    ln -s /Applications "$DIST/stage/Applications"
+    if printf '%s' "$BUILT_ARCHS" | grep -qw "arm64" && printf '%s' "$BUILT_ARCHS" | grep -qw "x86_64"; then
+        DMG_NAME="MenuBarMijia-$VERSION.dmg"
+    elif printf '%s' "$BUILT_ARCHS" | grep -qw "x86_64"; then
+        DMG_NAME="MenuBarMijia-$VERSION-x86_64.dmg"
+    else
+        DMG_NAME="MenuBarMijia-$VERSION-arm64.dmg"
+    fi
+    DMG="$DIST/$DMG_NAME"
+    echo "▶ 正在制作 DMG（${DMG_NAME}，架构：${ARCHS}）..."
+    hdiutil create -volname "MenuBarMijia $VERSION" -srcfolder "$DIST/stage" -ov -format UDZO "$DMG" >/dev/null
+    rm -rf "$DIST/stage"
+    (cd "$DIST" && shasum -a 256 "$DMG_NAME" | tee "$DMG_NAME.sha256")
+    echo "✅ 已生成 Intel/当前架构安装包：$DMG"
+fi
 
 if [ "$WAS_RUNNING" = "1" ]; then
     open "$APP_DIR"

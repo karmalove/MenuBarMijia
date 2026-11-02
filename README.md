@@ -223,8 +223,14 @@ The macOS app is not yet notarized by Apple, so you may need to allow it in Syst
 # Run secret checks, linters, and Swift tests on macOS
 bash scripts/check.sh
 
-# Build, sign locally, and launch MenuBarMijia.app
+# Build, sign locally, and launch MenuBarMijia.app (host CPU: Intel → x86_64, Apple Silicon → arm64)
 bash scripts/build_app.sh
+
+# Intel CPU DMG (native on Intel Macs; cross-compiles x86_64 on Apple Silicon)
+bash scripts/build_intel_dmg.sh
+
+# Universal Binary DMG for both Apple Silicon and Intel
+REQUIRE_UNIVERSAL=1 MAKE_DMG=1 bash scripts/build_app.sh
 
 # Build and test the Windows tray app
 cd windows

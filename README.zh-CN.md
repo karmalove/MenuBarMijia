@@ -223,8 +223,14 @@ macOS 安装包尚未经过 Apple 公证，首次打开时可能需要在系统�
 # macOS 本地全量测试与代码门禁检查
 bash scripts/check.sh
 
-# 编译、打包并启动 macOS 本地构建
+# 编译、打包并启动 macOS 本地构建（本机 CPU：Intel → x86_64，Apple Silicon → arm64）
 bash scripts/build_app.sh
+
+# Intel CPU 的 x86_64 DMG（Intel 本机原生编译；Apple Silicon 上交叉编译）
+bash scripts/build_intel_dmg.sh
+
+# 同时覆盖 Apple Silicon 与 Intel 的通用二进制 DMG
+REQUIRE_UNIVERSAL=1 MAKE_DMG=1 bash scripts/build_app.sh
 
 # Windows 托盘版本地构建与测试
 cd windows

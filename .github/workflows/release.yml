@@ -190,6 +190,9 @@ jobs:
           DEVELOPER_ID: ${{ steps.signing.outputs.identity }}
           MACOS_CERT_SHA1: ${{ steps.signing.outputs.sha1 }}
           SKIP_NOTARIZE: "1"
+          REQUIRE_UNIVERSAL: "1"
+          MACOS_ARCHS: "arm64 x86_64"
+          MACOSX_DEPLOYMENT_TARGET: "14.0"
         run: bash scripts/release.sh
 
       - name: Check macOS build outputs

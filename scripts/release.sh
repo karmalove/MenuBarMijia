@@ -29,6 +29,11 @@ VERSION="$(tr -d '[:space:]' < VERSION)"
 APP="$ROOT/MenuBarMijia.app"
 DIST="$ROOT/dist"
 DMG="$DIST/MenuBarMijia-$VERSION.dmg"
+# 正式发布默认打 arm64 + x86_64 通用二进制，同一份 DMG 覆盖 Intel 与 Apple Silicon。
+# Intel 本机只打 x86_64：REQUIRE_UNIVERSAL=0 MACOS_ARCHS=x86_64 SKIP_NOTARIZE=1 bash scripts/release.sh
+export REQUIRE_UNIVERSAL="${REQUIRE_UNIVERSAL:-1}"
+export MACOS_ARCHS="${MACOS_ARCHS:-arm64 x86_64}"
+export MACOSX_DEPLOYMENT_TARGET="${MACOSX_DEPLOYMENT_TARGET:-14.0}"
 
 echo "▶ [0/5] 运行门禁检查与 Release 模式单元测试..."
 bash scripts/check.sh --lint-only
@@ -102,9 +107,23 @@ fi
 
 echo "▶ [5/5] 最终检查"
 APP_ARCHS="$(lipo -archs "$APP/Contents/MacOS/MenuBarMijiaApp" 2>/dev/null || true)"
-if ! printf '%s' "$APP_ARCHS" | grep -qw "arm64" || ! printf '%s' "$APP_ARCHS" | grep -qw "x86_64"; then
-    echo "❌ 发布二进制缺少通用架构支持（当前：${APP_ARCHS:-<未知>}，期望：arm64 + x86_64），已中止发布！" >&2
-    exit 1
+if [ "${REQUIRE_UNIVERSAL:-1}" = "1" ]; then
+    if ! printf '%s' "$APP_ARCHS" | grep -qw "arm64" || ! printf '%s' "$APP_ARCHS" | grep -qw "x86_64"; then
+        echo "❌ 发布二进制缺少通用架构支持（当前：${APP_ARCHS:-<未知>}，期望：arm64 + x86_64），已中止发布！" >&2
+        exit 1
+    fi
+else
+    missing=0
+    for arch in $MACOS_ARCHS; do
+        if ! printf '%s' "$APP_ARCHS" | grep -qw "$arch"; then
+            missing=1
+        fi
+    done
+    if [ "$missing" = "1" ] || [ -z "$APP_ARCHS" ]; then
+        echo "❌ 发布二进制缺少请求的架构（当前：${APP_ARCHS:-<未知>}，期望：${MACOS_ARCHS}），已中止发布！" >&2
+        exit 1
+    fi
+    echo "ℹ️ 单架构发布包：${APP_ARCHS}（REQUIRE_UNIVERSAL=0）"
 fi
 for file in "$APP/Contents/MacOS/MenuBarMijiaApp" "$DMG"; do
     if grep -aq "/Users/" "$file"; then
